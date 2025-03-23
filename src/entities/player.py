@@ -5,6 +5,7 @@ from typing import Tuple
 from dataclasses import dataclass
 from systems.abilities import AbilitySystem, Skill, Passive
 from systems.gear import GearSystem, GearItem, GearSlot
+from systems.progression import MetaUpgradeType
 import random
 
 @dataclass
@@ -19,7 +20,7 @@ class Stats:
         self.speed = speed
 
 class Player(Entity):
-    def __init__(self, x: float, y: float, character_class: str = 'warrior'):
+    def __init__(self, x: float, y: float, character_class: str = 'warrior', progression_system=None):
         # Set color based on character class
         color_map = {
             'warrior': (255, 0, 0),    # Red
@@ -30,6 +31,9 @@ class Player(Entity):
         
         super().__init__(x, y, 32, 32, color)
         
+        # Store progression system reference
+        self.progression = progression_system
+        
         # Set character class and stats
         self.character_class = character_class
         self.stats = self._create_stats()
@@ -38,11 +42,22 @@ class Player(Entity):
         self.abilities = AbilitySystem()
         self.gear = GearSystem()
         
-        # Animation properties
-        self.attacking = False
-        self.attack_frame = 0
-        self.attack_duration = 20  # frames
-        self.attack_range = 50  # pixels
+        # Set attack properties based on class
+        if character_class == 'warrior':
+            self.attack_range = 50  # Close range
+            self.attack_duration = 20  # frames
+            self.attack_cooldown_max = 30  # frames
+            self.projectile_speed = 0  # No projectiles
+        elif character_class == 'rogue':
+            self.attack_range = 150  # Medium range
+            self.attack_duration = 15  # frames
+            self.attack_cooldown_max = 25  # frames
+            self.projectile_speed = 8  # Fast projectiles
+        else:  # mage
+            self.attack_range = 200  # Long range
+            self.attack_duration = 10  # frames
+            self.attack_cooldown_max = 35  # frames
+            self.projectile_speed = 6  # Medium speed projectiles
         
         # Movement properties
         self.target_x = x
@@ -58,14 +73,35 @@ class Player(Entity):
         self._initialize_class_abilities()
         
     def _create_stats(self) -> Stats:
-        """Create stats based on character class."""
+        """Create stats based on character class and meta-upgrades."""
+        # Get base stats
         if self.character_class == 'warrior':
-            return Stats(level=1, hp=50, max_hp=50, attack=8, defense=4, speed=4)
+            base_stats = Stats(level=1, hp=50, max_hp=50, attack=8, defense=4, speed=4)
         elif self.character_class == 'rogue':
-            return Stats(level=1, hp=40, max_hp=40, attack=12, defense=2, speed=5)
+            base_stats = Stats(level=1, hp=40, max_hp=40, attack=12, defense=2, speed=5)
         elif self.character_class == 'mage':
-            return Stats(level=1, hp=30, max_hp=30, attack=15, defense=1, speed=3)
-        return Stats()  # Default stats if class not found
+            base_stats = Stats(level=1, hp=30, max_hp=30, attack=15, defense=1, speed=3)
+        else:
+            base_stats = Stats()
+        
+        # Apply meta-upgrade effects if available
+        if self.progression:
+            # Apply starting level
+            starting_level = int(self.progression.get_upgrade_effect(MetaUpgradeType.STARTING_LEVEL))
+            if starting_level > 0:
+                base_stats.level = starting_level + 1
+                base_stats.hp += starting_level * 10
+                base_stats.max_hp += starting_level * 10
+                base_stats.attack += starting_level * 2
+                base_stats.defense += starting_level
+                base_stats.speed += starting_level
+            
+            # Apply max health boost
+            health_multiplier = 1.0 + self.progression.get_upgrade_effect(MetaUpgradeType.MAX_HEALTH)
+            base_stats.hp = int(base_stats.hp * health_multiplier)
+            base_stats.max_hp = int(base_stats.max_hp * health_multiplier)
+        
+        return base_stats
         
     def _initialize_class_abilities(self):
         """Initialize class-specific skills and passives."""
@@ -108,6 +144,49 @@ class Player(Entity):
                 effect_type="damage_bonus",
                 value=0.25
             ))
+            
+    def attack(self, target: Entity) -> bool:
+        """Attack a target, applying skills, passives, and gear bonuses."""
+        if not self.can_attack():
+            return False
+            
+        # Check for critical hit
+        is_critical = False
+        crit_chance = self.abilities.apply_passive_effects(0)['crit_chance']
+        if random.random() < crit_chance:
+            is_critical = True
+        
+        # Calculate base damage
+        base_damage = self.stats.attack
+        
+        # Apply gear bonuses
+        gear_stats = self.gear.get_total_stats()
+        base_damage += gear_stats.get('attack', 0)
+        
+        # Apply passive effects
+        effects = self.abilities.apply_passive_effects(base_damage, is_critical)
+        damage = base_damage * effects['damage_multiplier']
+        
+        if is_critical:
+            damage *= effects['crit_multiplier']
+        
+        # Handle different attack types
+        if self.character_class == 'warrior':
+            # Close range attack
+            self.start_attack()
+            target.stats.hp -= int(damage)
+        else:
+            # Ranged attack (rogue or mage)
+            self.shoot_projectile(target.x, target.y, 
+                                self.projectile_speed, int(damage))
+        
+        # Apply life steal if any
+        life_steal = effects['life_steal']
+        if life_steal > 0:
+            heal_amount = int(damage * life_steal)
+            self.stats.hp = min(self.stats.max_hp, self.stats.hp + heal_amount)
+        
+        return True
         
     def update(self):
         super().update()
@@ -137,39 +216,6 @@ class Player(Entity):
         """Set movement target."""
         self.target_x = x
         self.target_y = y
-        
-    def attack(self, target: Entity) -> bool:
-        """Attack a target, applying skills, passives, and gear bonuses."""
-        # Check for critical hit
-        is_critical = False
-        crit_chance = self.abilities.apply_passive_effects(0)['crit_chance']
-        if random.random() < crit_chance:
-            is_critical = True
-        
-        # Calculate base damage
-        base_damage = self.stats.attack
-        
-        # Apply gear bonuses
-        gear_stats = self.gear.get_total_stats()
-        base_damage += gear_stats.get('attack', 0)
-        
-        # Apply passive effects
-        effects = self.abilities.apply_passive_effects(base_damage, is_critical)
-        damage = base_damage * effects['damage_multiplier']
-        
-        if is_critical:
-            damage *= effects['crit_multiplier']
-        
-        # Apply damage
-        target.stats.hp -= int(damage)
-        
-        # Apply life steal if any
-        life_steal = effects['life_steal']
-        if life_steal > 0:
-            heal_amount = int(damage * life_steal)
-            self.stats.hp = min(self.stats.max_hp, self.stats.hp + heal_amount)
-        
-        return True
         
     def gain_experience(self, amount: int):
         """Gain experience points and check for level up."""
